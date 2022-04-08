@@ -39,7 +39,7 @@ Options:
 
     - tools/node-modules checkout --force     # disable this check
 
-    - tools/node-modules rebuild              # npm install with our package.json
+    - tools/node-modules install              # npm install with our package.json
 
 $0: *** aborting
 
@@ -56,33 +56,100 @@ EOF
     clone_from_cache "${sha}"
 }
 
-cmd_rebuild() {
-    for file in npm-shrinkwrap.json package-lock.json yarn.lock; do
-        if [ -e "${file}" ]; then
-            echo "Please delete ${file} from $(pwd) and start again"
-            exit 1
-        fi
-    done
+cmd_npm_install() {
+    # Lots of cockpit developers are using toolbox, which can't recursively run
+    # podman, but flatpak-spawn offers a nice workaround for that.
+    if [ -f /run/.toolboxenv ]; then
+        exec flatpak-spawn --host -- "$0" npm_install "$@"
+        exit 1
+    fi
 
+    CACHE="cockpit-project-npm-cache-volume"
+    IMAGE="docker.io/library/node:alpine"
+
+    # make sure the node user can write to the cache volume
+    podman run \
+        --rm \
+        --volume "${CACHE}":/home/node/.npm:U \
+        "${IMAGE}" chown -R node:node /home/node >&2
+
+    # do the actual work
+    exec podman run \
+        --log-driver='none' \
+        --rm \
+        --init \
+        --user node \
+        --workdir /home/node \
+        --interactive \
+        --attach stdin \
+        --attach stdout \
+        --attach stderr \
+        --volume "${CACHE}":/home/node/.npm \
+        "${IMAGE}" /bin/sh -c '
+            set -eux
+            tee package.json >/dev/null
+            # We background npm and wait for it: this allows the script to be terminated with ^C
+            # Otherwise, termination would fail, because podman delivers the signal to the main
+            # process (the shell) which ignores SIGINT until npm returns.  npm never see it.
+            npm install --ignore-scripts >&2 & wait
+            cp package.json node_modules/.package.json
+            tar c node_modules
+        '
+}
+
+cat_file() {
+    case "$1" in
+        *:*)
+            git cat-file blob "$1";;
+        *)
+            cat "$1";;
+    esac
+}
+
+tar_to_git() {
+    tar --exclude '.git*' --extract "$1"
+    message INDEX "node_modules"
+    git -C "$1" init --quiet --initial-branch=main
+    git -C "$1" add --all
+}
+
+cmd_install() {
     cmd_remove
 
-    npm install
+    cmd_npm_install < package.json | tar_to_git node_modules
 
-    # try to keep this vaguely in sync with what .github/workflows/node_modules-* do
-    cp package.json node_modules/.package.json
-    cp package-lock.json node_modules/.package-lock.json
-    echo /.cache > node_modules/.gitignore
+    # consistency check
+    cmp package.json node_modules/.package.json
+    ls -l node_modules/.package-lock.json >&2
 
-    git -C node_modules init -b main
-    git -C node_modules add .
-    git -C node_modules -c gc.autoDetach=false commit -a -m "$(sha256sum package.json)"
+    # commit
+    git -C node_modules commit --quiet --message "$(sha256sum package.json)"
+
+    sha="$(git -C node_modules rev-parse HEAD)"
+    tag="sha-${sha}"
+    message TAG "${tag}"
+    git -C node_modules tag -f "${tag}" "${sha}"
 
     cat <<EOF
 Next steps:
 
   - git add node_modules && git commit
+  - tools/node-modules push
 
 EOF
+}
+
+cmd_tree_hash() {
+    rm -rf tmp/npm-tree-hash
+    mkdir -p tmp/npm-tree-hash
+    git cat-file blob "$1:package.json" | cmd_npm_install | (cd tmp/npm-tree-hash && tar_to_git node_modules)
+    git -C tmp/npm-tree-hash/node_modules write-tree
+}
+
+cmd_push() {
+    tag="sha-$(git -C node_modules rev-parse HEAD)"
+    message PUSH "${GITHUB_REPO} ${tag}"
+    git -C node_modules push "${SSH_REMOTE}" "${tag}"
 }
 
 # called from Makefile.am
@@ -125,7 +192,7 @@ cmd_make_package_lock_json() {
 *** package.json is out of sync with node_modules
 *** If you modified package.json, please run:
 ***
-***    tools/node-modules rebuild
+***    tools/node-modules install
 ***
 *** and add the result to the index.
 EOF
@@ -150,7 +217,7 @@ main() {
 
     if [ -z "${cmd}" ]; then
         # don't list the "private" ones
-        echo 'This command requires a subcommand: remove checkout rebuild'
+        echo 'This command requires a subcommand: remove checkout install push'
         exit 1
     elif ! type -t "cmd_${cmd}" | grep -q function; then
         echo "Unknown subcommand ${cmd}"
